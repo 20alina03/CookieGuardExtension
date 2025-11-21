@@ -9,8 +9,137 @@ let cookieStats = {
   allowed: 0
 };
 
-// Store blocked cookies history to maintain count
-let blockedCookiesHistory = new Set();
+// Store complete cookie history with full details
+let cookieHistory = new Map();
+let cookieExplanations = new Map(); // Cache AI explanations
+
+// Groq API configuration (FREE)
+
+// Load cookie history and explanations from storage on startup
+chrome.storage.local.get(['cookieHistory', 'cookieExplanations'], (result) => {
+  if (result.cookieHistory) {
+    cookieHistory = new Map(Object.entries(result.cookieHistory));
+    console.log('Loaded cookie history:', cookieHistory.size, 'cookies');
+  }
+  if (result.cookieExplanations) {
+    cookieExplanations = new Map(Object.entries(result.cookieExplanations));
+    console.log('Loaded cookie explanations:', cookieExplanations.size, 'explanations');
+  }
+});
+
+// Save cookie history to storage periodically
+function saveCookieHistory() {
+  const historyObj = Object.fromEntries(cookieHistory);
+  chrome.storage.local.set({ cookieHistory: historyObj }, () => {
+    console.log('Cookie history saved:', cookieHistory.size, 'cookies');
+  });
+}
+
+// Save cookie explanations to storage
+function saveCookieExplanations() {
+  const explanationsObj = Object.fromEntries(cookieExplanations);
+  chrome.storage.local.set({ cookieExplanations: explanationsObj }, () => {
+    console.log('Cookie explanations saved:', cookieExplanations.size, 'explanations');
+  });
+}
+
+// Get AI explanation for cookie (with caching)
+async function getAIExplanation(cookie) {
+  const cookieKey = `${cookie.name}_${cookie.domain}`;
+  
+  // Check cache first
+  if (cookieExplanations.has(cookieKey)) {
+    console.log('Using cached explanation for:', cookie.name);
+    return cookieExplanations.get(cookieKey);
+  }
+  
+  try {
+    const potentialData = cookie.potentialData || [];
+    const dataTypesText = potentialData.length > 0 
+      ? potentialData.join(', ') 
+      : 'no specific data types detected';
+    
+    const prompt = `You are a privacy expert explaining cookies to non-technical users. Explain this cookie in 2-3 simple sentences:
+
+Cookie Name: ${cookie.name}
+Domain: ${cookie.domain}
+Collects: ${dataTypesText}
+Expires: ${cookie.expirationDate ? 'Long-term' : 'Session only'}
+
+Explain:
+1. What this cookie does in simple terms
+2. Why the website uses it
+3. Privacy concern (if any)
+
+Keep it under 50 words, casual friendly tone.`;
+
+    const response = await fetch(GROQ_API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant', // Fast and free
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a friendly privacy expert who explains technical concepts in simple, everyday language.'
+          },
+          {
+            role: 'user',
+            content: prompt
+          }
+        ],
+        temperature: 0.7,
+        max_tokens: 150
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Groq API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    const explanation = data.choices[0].message.content.trim();
+    
+    // Cache the explanation
+    cookieExplanations.set(cookieKey, explanation);
+    saveCookieExplanations();
+    
+    console.log('AI explanation generated for:', cookie.name);
+    return explanation;
+    
+  } catch (error) {
+    console.error('Error getting AI explanation:', error);
+    
+    // Fallback explanation
+    const fallbackExplanations = {
+      'session': 'This is a session cookie that helps the website remember you while you browse. It expires when you close your browser.',
+      'tracking': 'This cookie tracks your browsing activity across pages. It helps the site understand how you use their service.',
+      'analytics': 'This cookie collects statistics about how you use the website. Companies use this data to improve their site.',
+      'advertising': 'This cookie is used to show you personalized ads based on your interests and browsing history.',
+      'preference': 'This cookie remembers your settings and preferences so you don\'t have to set them every time.',
+      'default': 'This cookie helps the website function properly. It may store information about your session or preferences.'
+    };
+    
+    // Determine fallback type
+    const name = cookie.name.toLowerCase();
+    const potentialData = cookie.potentialData || [];
+    
+    if (name.includes('session') || name.includes('sid')) {
+      return fallbackExplanations.session;
+    } else if (potentialData.includes('marketing_data') || name.includes('ad')) {
+      return fallbackExplanations.advertising;
+    } else if (potentialData.includes('browsing_behavior') || name.includes('analytics')) {
+      return fallbackExplanations.analytics;
+    } else if (potentialData.includes('preferences') || name.includes('pref')) {
+      return fallbackExplanations.preference;
+    } else {
+      return fallbackExplanations.default;
+    }
+  }
+}
 
 // Update active tab domain when tab changes
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
@@ -38,12 +167,33 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 // Monitor cookie changes
 chrome.cookies.onChanged.addListener(async (changeInfo) => {
   if (!changeInfo.removed) {
-    await analyzeCookie(changeInfo.cookie);
-    // Check if cookie should be blocked
+    const potentialData = detectPotentialData(changeInfo.cookie);
+    const riskScore = await calculateRiskScore(changeInfo.cookie, potentialData);
+    
+    const cookieKey = `${changeInfo.cookie.name}_${changeInfo.cookie.domain}`;
+    
+    cookieHistory.set(cookieKey, {
+      ...changeInfo.cookie,
+      potentialData: potentialData,
+      riskScore: riskScore,
+      firstSeen: cookieHistory.has(cookieKey) ? cookieHistory.get(cookieKey).firstSeen : Date.now(),
+      lastSeen: Date.now(),
+      status: 'active'
+    });
+    
+    saveCookieHistory();
+    
+    await analyzeCookie(changeInfo.cookie, potentialData, riskScore);
+    
     const shouldBlock = await shouldBlockCookie(changeInfo.cookie);
     if (shouldBlock) {
-      const cookieKey = `${changeInfo.cookie.name}_${changeInfo.cookie.domain}`;
-      blockedCookiesHistory.add(cookieKey);
+      const historyEntry = cookieHistory.get(cookieKey);
+      if (historyEntry) {
+        historyEntry.status = 'blocked';
+        historyEntry.blockedAt = Date.now();
+        cookieHistory.set(cookieKey, historyEntry);
+        saveCookieHistory();
+      }
       
       await chrome.cookies.remove({
         url: getCookieUrl(changeInfo.cookie),
@@ -51,16 +201,23 @@ chrome.cookies.onChanged.addListener(async (changeInfo) => {
       });
       console.log('Blocked cookie:', changeInfo.cookie.name);
     }
+  } else {
+    const cookieKey = `${changeInfo.cookie.name}_${changeInfo.cookie.domain}`;
+    const historyEntry = cookieHistory.get(cookieKey);
+    if (historyEntry && historyEntry.status === 'active') {
+      historyEntry.status = 'removed';
+      historyEntry.removedAt = Date.now();
+      cookieHistory.set(cookieKey, historyEntry);
+      saveCookieHistory();
+    }
   }
   
-  // Update stats when cookies change
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   if (tabs.length > 0 && tabs[0].url) {
     await updateCookieStats(tabs[0].url);
   }
 });
 
-// Scan cookies when navigation completes
 chrome.webNavigation.onCompleted.addListener((details) => {
   if (details.url && details.url.startsWith('http')) {
     scanExistingCookies(details.url);
@@ -105,28 +262,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse(data);
       });
       return true;
+      
+    case 'GET_AI_EXPLANATION':
+      getAIExplanation(message.cookie).then(explanation => {
+        sendResponse({ explanation: explanation });
+      });
+      return true;
   }
 });
 
-async function analyzeCookie(cookie) {
+async function analyzeCookie(cookie, potentialData, riskScore) {
   try {
-    const riskScore = await calculateRiskScore(cookie);
-    
-    // Check settings for notifications
     const settings = await chrome.storage.sync.get(['showNotifications']);
     
-    if (riskScore >= 2 && settings.showNotifications !== false) {
+    if (riskScore >= 3 && settings.showNotifications !== false) {
       console.log(`Suspicious cookie detected: ${cookie.name} (Risk: ${riskScore})`);
       
-      // Try to send to content script for notification
       const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
       if (tabs.length > 0 && tabs[0].url && tabs[0].url.startsWith('http')) {
         chrome.tabs.sendMessage(tabs[0].id, {
           type: 'SUSPICIOUS_COOKIE',
-          cookie: cookie,
+          cookie: { ...cookie, potentialData: potentialData },
           riskScore: riskScore
         }).catch(error => {
-          // Content script might not be ready, this is normal
+          // Content script might not be ready
         });
       }
     }
@@ -135,35 +294,36 @@ async function analyzeCookie(cookie) {
   }
 }
 
-async function calculateRiskScore(cookie) {
+async function calculateRiskScore(cookie, potentialData) {
   let score = 0;
   
-  // Check for tracking patterns in cookie name and value
-  const trackingPatterns = ['_ga', '_gid', '_fbp', 'fr', 'track', 'uid', 'id', 'analytics', 'ad', 'pixel'];
+  const dataTypes = potentialData || detectPotentialData(cookie);
+  score += dataTypes.length;
+  
+  const trackingPatterns = ['_ga', '_gid', '_fbp', 'fr', 'track', 'uid', 'analytics', 'ad', 'pixel'];
   const cookieStr = (cookie.name + cookie.value).toLowerCase();
   
   trackingPatterns.forEach(pattern => {
     if (cookieStr.includes(pattern)) score += 1;
   });
   
-  // Check for third-party cookies
   try {
     if (activeTabDomain && !isSameDomain(cookie.domain, activeTabDomain)) {
-      score += 2; // Third-party cookie
+      score += 2;
     }
   } catch (error) {
     console.log('Error checking cookie domain:', error);
   }
   
-  // Check expiration (long-lived cookies are more suspicious)
   if (cookie.expirationDate && cookie.expirationDate > (Date.now() / 1000) + 31536000) {
     score += 1;
   }
   
-  // Check secure flag (non-secure cookies on HTTPS sites)
-  if (!cookie.secure && activeTabDomain && activeTabDomain.startsWith('https://')) {
+  if (!cookie.secure && cookie.domain && !cookie.domain.startsWith('http')) {
     score += 1;
   }
+  
+  console.log(`Cookie ${cookie.name}: ${dataTypes.length} data types, total score: ${score}`);
   
   return score;
 }
@@ -188,18 +348,34 @@ async function scanExistingCookies(url) {
     const cookies = await chrome.cookies.getAll({ url });
     console.log(`Found ${cookies.length} cookies for ${url}`);
     
-    // Check auto-block settings
     const settings = await chrome.storage.sync.get(['autoBlockHighRisk']);
     
     for (const cookie of cookies) {
-      await analyzeCookie(cookie);
+      const potentialData = detectPotentialData(cookie);
+      const riskScore = await calculateRiskScore(cookie, potentialData);
       
-      // Auto-block high-risk cookies if enabled
+      const cookieKey = `${cookie.name}_${cookie.domain}`;
+      
+      cookieHistory.set(cookieKey, {
+        ...cookie,
+        potentialData: potentialData,
+        riskScore: riskScore,
+        firstSeen: cookieHistory.has(cookieKey) ? cookieHistory.get(cookieKey).firstSeen : Date.now(),
+        lastSeen: Date.now(),
+        status: 'active'
+      });
+      
+      await analyzeCookie(cookie, potentialData, riskScore);
+      
       if (settings.autoBlockHighRisk) {
-        const riskScore = await calculateRiskScore(cookie);
         if (riskScore >= 5) {
-          const cookieKey = `${cookie.name}_${cookie.domain}`;
-          blockedCookiesHistory.add(cookieKey);
+          const historyEntry = cookieHistory.get(cookieKey);
+          if (historyEntry) {
+            historyEntry.status = 'blocked';
+            historyEntry.blockedAt = Date.now();
+            historyEntry.autoBlocked = true;
+            cookieHistory.set(cookieKey, historyEntry);
+          }
           
           await chrome.cookies.remove({
             url: getCookieUrl(cookie),
@@ -207,7 +383,6 @@ async function scanExistingCookies(url) {
           });
           console.log('Auto-blocked high-risk cookie:', cookie.name);
           
-          // Store block action
           const permissionKey = `cookie_${cookie.name}_${cookie.domain}`;
           await chrome.storage.sync.set({
             [permissionKey]: {
@@ -216,12 +391,16 @@ async function scanExistingCookies(url) {
               timestamp: Date.now(),
               cookieName: cookie.name,
               cookieDomain: cookie.domain,
-              autoBlocked: true
+              autoBlocked: true,
+              blocked: true,
+              potentialData: potentialData
             }
           });
         }
       }
     }
+    
+    saveCookieHistory();
   } catch (error) {
     console.log('Error scanning cookies:', error);
   }
@@ -233,7 +412,8 @@ async function handleCookiePermissionsUpdate(cookie, allowedDataTypes, action) {
   const permissionKey = `cookie_${cookie.name}_${cookie.domain}`;
   const cookieKey = `${cookie.name}_${cookie.domain}`;
   
-  // Store the user's preference
+  const isBlocking = action === 'block' || (action === 'custom' && allowedDataTypes.length === 0);
+  
   await chrome.storage.sync.set({
     [permissionKey]: {
       allowedDataTypes: allowedDataTypes,
@@ -242,15 +422,24 @@ async function handleCookiePermissionsUpdate(cookie, allowedDataTypes, action) {
       cookieName: cookie.name,
       cookieDomain: cookie.domain,
       potentialData: cookie.potentialData || [],
-      blocked: action === 'block' || (action === 'custom' && allowedDataTypes.length === 0)
+      blocked: isBlocking
     }
   });
   
-  // Actually block the cookie if action is 'block'
-  if (action === 'block' || (action === 'custom' && allowedDataTypes.length === 0)) {
+  const historyEntry = cookieHistory.get(cookieKey);
+  if (historyEntry) {
+    historyEntry.status = isBlocking ? 'blocked' : 'active';
+    if (isBlocking) {
+      historyEntry.blockedAt = Date.now();
+    }
+    historyEntry.userAction = action;
+    historyEntry.allowedDataTypes = allowedDataTypes;
+    cookieHistory.set(cookieKey, historyEntry);
+    saveCookieHistory();
+  }
+  
+  if (isBlocking) {
     try {
-      blockedCookiesHistory.add(cookieKey);
-      
       await chrome.cookies.remove({
         url: getCookieUrl(cookie),
         name: cookie.name
@@ -259,12 +448,8 @@ async function handleCookiePermissionsUpdate(cookie, allowedDataTypes, action) {
     } catch (error) {
       console.error('Error removing cookie:', error);
     }
-  } else {
-    // If allowing, remove from blocked history
-    blockedCookiesHistory.delete(cookieKey);
   }
   
-  // Update stats after permission change
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   if (tabs.length > 0 && tabs[0].url) {
     await updateCookieStats(tabs[0].url);
@@ -296,6 +481,7 @@ function getCookieUrl(cookie) {
 
 async function updateCookieStats(url) {
   try {
+    const hostname = new URL(url).hostname;
     const cookies = await chrome.cookies.getAll({ url });
     const allPermissions = await chrome.storage.sync.get(null);
     
@@ -303,15 +489,15 @@ async function updateCookieStats(url) {
     let blockedCount = 0;
     let allowedCount = 0;
     
-    // Track all cookies (current + blocked)
     const allCookieKeys = new Set();
     
-    // Add current cookies
     for (const cookie of cookies) {
       const cookieKey = `${cookie.name}_${cookie.domain}`;
       allCookieKeys.add(cookieKey);
       
-      const riskScore = await calculateRiskScore(cookie);
+      const potentialData = detectPotentialData(cookie);
+      const riskScore = await calculateRiskScore(cookie, potentialData);
+      
       if (riskScore >= 3) {
         suspiciousCount++;
       }
@@ -327,22 +513,24 @@ async function updateCookieStats(url) {
       }
     }
     
-    // Count blocked cookies from permissions
-    for (const [key, value] of Object.entries(allPermissions)) {
-      if (key.startsWith('cookie_') && value.blocked) {
-        const cookieKey = `${value.cookieName}_${value.cookieDomain}`;
-        
-        // Add to all cookies count if not already present
+    for (const [cookieKey, historyEntry] of cookieHistory.entries()) {
+      const cookieDomain = historyEntry.domain.replace(/^\./, '');
+      if (hostname.includes(cookieDomain) || cookieDomain.includes(hostname)) {
         if (!allCookieKeys.has(cookieKey)) {
           allCookieKeys.add(cookieKey);
           
-          // Check if it was suspicious when blocked
-          if (value.potentialData && value.potentialData.length >= 3) {
+          if (historyEntry.riskScore >= 3) {
             suspiciousCount++;
           }
         }
         
-        blockedCount++;
+        const permissionKey = `cookie_${historyEntry.name}_${historyEntry.domain}`;
+        if (allPermissions[permissionKey] && allPermissions[permissionKey].blocked) {
+          if (historyEntry.status !== 'blocked') {
+            historyEntry.status = 'blocked';
+          }
+          blockedCount++;
+        }
       }
     }
     
@@ -357,13 +545,10 @@ async function updateCookieStats(url) {
     
     console.log('Updated stats:', cookieStats);
     
-    // Broadcast stats update to popup
     chrome.runtime.sendMessage({
       type: 'STATS_UPDATED',
       stats: cookieStats
-    }).catch(() => {
-      // Popup might not be open
-    });
+    }).catch(() => {});
     
     return cookieStats;
   } catch (error) {
@@ -380,10 +565,10 @@ async function getAllCookieData() {
     }
     
     const url = tabs[0].url;
+    const hostname = new URL(url).hostname;
     const cookies = await chrome.cookies.getAll({ url });
     const allData = await chrome.storage.sync.get(null);
     
-    // Separate permissions from settings
     const permissions = {};
     const settings = {};
     
@@ -395,17 +580,16 @@ async function getAllCookieData() {
       }
     }
     
-    // Analyze each cookie (including blocked ones from history)
     const analyzedCookies = [];
     const processedCookies = new Set();
     
-    // Process current cookies
     for (const cookie of cookies) {
       const cookieKey = `${cookie.name}_${cookie.domain}`;
       processedCookies.add(cookieKey);
       
-      const potentialData = detectPotentialData(cookie);
-      const riskScore = await calculateRiskScore(cookie);
+      const historyEntry = cookieHistory.get(cookieKey);
+      const potentialData = historyEntry ? historyEntry.potentialData : detectPotentialData(cookie);
+      const riskScore = historyEntry ? historyEntry.riskScore : await calculateRiskScore(cookie, potentialData);
       
       let riskLevel = 'low';
       if (riskScore >= 5) riskLevel = 'high';
@@ -413,6 +597,12 @@ async function getAllCookieData() {
       
       const permissionKey = `cookie_${cookie.name}_${cookie.domain}`;
       const permission = permissions[permissionKey] || null;
+      
+      // Get AI explanation (cached if available)
+      const explanation = await getAIExplanation({
+        ...cookie,
+        potentialData: potentialData
+      });
       
       analyzedCookies.push({
         name: cookie.name,
@@ -427,31 +617,53 @@ async function getAllCookieData() {
         riskLevel: riskLevel,
         riskScore: riskScore,
         permission: permission,
-        status: permission && permission.blocked ? 'blocked' : 'active'
+        status: permission && permission.blocked ? 'blocked' : 'active',
+        firstSeen: historyEntry ? historyEntry.firstSeen : Date.now(),
+        lastSeen: historyEntry ? historyEntry.lastSeen : Date.now(),
+        aiExplanation: explanation
       });
     }
     
-    // Add blocked cookies that are no longer present
-    for (const [key, value] of Object.entries(permissions)) {
-      if (value.blocked) {
-        const cookieKey = `${value.cookieName}_${value.cookieDomain}`;
-        if (!processedCookies.has(cookieKey)) {
-          analyzedCookies.push({
-            name: value.cookieName,
-            domain: value.cookieDomain,
-            value: '[BLOCKED]',
-            potentialData: value.potentialData || [],
-            riskLevel: 'high',
-            permission: value,
-            status: 'blocked'
-          });
-        }
+    for (const [cookieKey, historyEntry] of cookieHistory.entries()) {
+      if (processedCookies.has(cookieKey)) continue;
+      
+      const cookieDomain = historyEntry.domain.replace(/^\./, '');
+      if (hostname.includes(cookieDomain) || cookieDomain.includes(hostname)) {
+        const permissionKey = `cookie_${historyEntry.name}_${historyEntry.domain}`;
+        const permission = permissions[permissionKey] || null;
+        
+        let riskLevel = 'low';
+        if (historyEntry.riskScore >= 5) riskLevel = 'high';
+        else if (historyEntry.riskScore >= 3) riskLevel = 'medium';
+        
+        const explanation = await getAIExplanation(historyEntry);
+        
+        analyzedCookies.push({
+          name: historyEntry.name,
+          domain: historyEntry.domain,
+          value: '[BLOCKED/REMOVED]',
+          path: historyEntry.path || '/',
+          secure: historyEntry.secure || false,
+          httpOnly: historyEntry.httpOnly || false,
+          sameSite: historyEntry.sameSite || 'unspecified',
+          expirationDate: historyEntry.expirationDate,
+          potentialData: historyEntry.potentialData || [],
+          riskLevel: riskLevel,
+          riskScore: historyEntry.riskScore || 0,
+          permission: permission,
+          status: historyEntry.status || 'removed',
+          firstSeen: historyEntry.firstSeen,
+          lastSeen: historyEntry.lastSeen,
+          blockedAt: historyEntry.blockedAt,
+          autoBlocked: historyEntry.autoBlocked,
+          aiExplanation: explanation
+        });
       }
     }
     
     return {
       exportDate: new Date().toISOString(),
-      website: new URL(url).hostname,
+      website: hostname,
       cookies: analyzedCookies,
       permissions: permissions,
       settings: settings,
@@ -465,7 +677,7 @@ async function getAllCookieData() {
 
 function detectPotentialData(cookie) {
   const dataTypes = [];
-  const cookieStr = (cookie.name + '=' + cookie.value).toLowerCase();
+  const cookieStr = (cookie.name + '=' + (cookie.value || '')).toLowerCase();
   
   const dataPatterns = {
     'email': ['email', 'mail', '@'],
@@ -473,13 +685,13 @@ function detectPotentialData(cookie) {
     'location': ['location', 'geo', 'lat', 'long', 'gps', 'address', 'city', 'country', 'zip'],
     'device_info': ['device', 'os', 'browser', 'platform', 'useragent', 'screen', 'resolution', 'mobile'],
     'ip_address': ['ip', 'address', 'remoteaddr', 'clientip'],
-    'browsing_behavior': ['behavior', 'click', 'scroll', 'movement', 'activity', 'history', 'visit'],
-    'preferences': ['preference', 'setting', 'config', 'theme', 'language', 'currency'],
-    'session_data': ['session', 'login', 'token', 'auth', 'password', 'credential'],
+    'browsing_behavior': ['behavior', 'click', 'scroll', 'movement', 'activity', 'history', 'visit', 'visitor'],
+    'preferences': ['preference', 'setting', 'config', 'theme', 'language', 'currency', 'pref'],
+    'session_data': ['session', 'login', 'token', 'auth', 'password', 'credential', 'sid'],
     'marketing_data': ['ad', 'marketing', 'campaign', 'tracking', 'analytics', 'conversion'],
     'social_media_data': ['social', 'facebook', 'twitter', 'linkedin', 'instagram', 'google', 'youtube'],
     'shopping_data': ['cart', 'basket', 'purchase', 'product', 'item', 'price'],
-    'demographic_data': ['age', 'gender', 'birth', 'income', 'education']
+    'demographic_data': ['age', 'gender', 'birth', 'income', 'education', 'demographic']
   };
   
   for (const [dataType, patterns] of Object.entries(dataPatterns)) {
@@ -491,7 +703,6 @@ function detectPotentialData(cookie) {
   return [...new Set(dataTypes)];
 }
 
-// Initialize active tab domain on startup
 chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
   if (tabs.length > 0 && tabs[0].url && tabs[0].url.startsWith('http')) {
     activeTabDomain = new URL(tabs[0].url).hostname;
