@@ -14,6 +14,7 @@ let cookieHistory = new Map();
 let cookieExplanations = new Map(); // Cache AI explanations
 
 // Groq API configuration (FREE)
+const key = "";
 
 // Load cookie history and explanations from storage on startup
 chrome.storage.local.get(['cookieHistory', 'cookieExplanations'], (result) => {
