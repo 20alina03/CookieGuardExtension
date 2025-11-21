@@ -13,6 +13,19 @@ document.addEventListener('DOMContentLoaded', async function() {
   });
 });
 
+// Detect if cookie is ephemeral (temporary/short-lived)
+function isEphemeralCookie(cookie) {
+  const ephemeralPatterns = ['ST-', 'CONSISTENCY', 'GPS', 'YSC'];
+  const isShortLived = ephemeralPatterns.some(pattern => cookie.name.startsWith(pattern) || cookie.name === pattern);
+  
+  const hasNoExpiration = !cookie.expirationDate || cookie.expirationDate === 0;
+  
+  const isShortExpiration = cookie.expirationDate && 
+    (cookie.expirationDate - Date.now() / 1000) < 3600;
+  
+  return isShortLived || hasNoExpiration || isShortExpiration;
+}
+
 async function loadCurrentTabCookies() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -26,42 +39,14 @@ async function loadCurrentTabCookies() {
         <div style="font-size: 10px; color: #999; margin-top: 2px;">${url.origin}</div>
       `;
       
-      // Get cookies for current site
-      const cookies = await chrome.cookies.getAll({ url: tab.url });
-      
-      // Get all permissions to include blocked cookies
-      const allPermissions = await chrome.storage.sync.get(null);
-      
-      // Combine current cookies with blocked cookies
-      const allCookies = [...cookies];
-      const cookieKeys = new Set(cookies.map(c => `${c.name}_${c.domain}`));
-      
-      // Add blocked cookies that are no longer present
-      for (const [key, value] of Object.entries(allPermissions)) {
-        if (key.startsWith('cookie_') && value.blocked) {
-          const cookieKey = `${value.cookieName}_${value.cookieDomain}`;
-          if (!cookieKeys.has(cookieKey)) {
-            // Create a pseudo-cookie object for blocked cookie
-            allCookies.push({
-              name: value.cookieName,
-              domain: value.cookieDomain,
-              value: '[BLOCKED]',
-              path: '/',
-              secure: false,
-              httpOnly: false,
-              blocked: true,
-              permission: value,
-              potentialData: value.potentialData || []
-            });
-          }
-        }
-      }
+      // Get ALL cookie data from background (includes active, blocked, and removed cookies)
+      const response = await chrome.runtime.sendMessage({ type: 'GET_ALL_COOKIE_DATA' });
       
       const cookiesList = document.getElementById('cookies-list');
       
       await updateStats();
       
-      if (allCookies.length === 0) {
+      if (!response.cookies || response.cookies.length === 0) {
         cookiesList.innerHTML = `
           <div class="empty-state">
             <div style="font-size: 32px;">🍪</div>
@@ -76,18 +61,44 @@ async function loadCurrentTabCookies() {
       
       cookiesList.innerHTML = '';
       
-      // Sort cookies by risk level
-      const analyzedCookies = await Promise.all(
-        allCookies.map(cookie => analyzeCookieData(cookie))
-      );
-      analyzedCookies.sort((a, b) => {
-        // Blocked cookies first, then by risk score
-        if (a.isBlocked && !b.isBlocked) return -1;
-        if (!a.isBlocked && b.isBlocked) return 1;
+      // Enhanced sorting logic
+      response.cookies.sort((a, b) => {
+        const aBlockedByPermission = a.permission && a.permission.blocked;
+        const bBlockedByPermission = b.permission && b.permission.blocked;
+        
+        const aActive = a.status === 'active' && a.value !== '[BLOCKED/REMOVED]';
+        const bActive = b.status === 'active' && b.value !== '[BLOCKED/REMOVED]';
+        
+        const aBlocked = aBlockedByPermission && !aActive;
+        const bBlocked = bBlockedByPermission && !bActive;
+        
+        const aUnblockedNotSet = !aBlockedByPermission && !aActive && a.status !== 'removed';
+        const bUnblockedNotSet = !bBlockedByPermission && !bActive && b.status !== 'removed';
+        
+        const aRemoved = a.status === 'removed' && !aBlockedByPermission;
+        const bRemoved = b.status === 'removed' && !bBlockedByPermission;
+        
+        let aPriority = 0;
+        let bPriority = 0;
+        
+        if (aActive) aPriority = 4;
+        else if (aBlocked) aPriority = 3;
+        else if (aUnblockedNotSet) aPriority = 2;
+        else if (aRemoved) aPriority = 1;
+        
+        if (bActive) bPriority = 4;
+        else if (bBlocked) bPriority = 3;
+        else if (bUnblockedNotSet) bPriority = 2;
+        else if (bRemoved) bPriority = 1;
+        
+        if (aPriority !== bPriority) {
+          return bPriority - aPriority;
+        }
+        
         return b.riskScore - a.riskScore;
       });
       
-      for (const cookie of analyzedCookies) {
+      for (const cookie of response.cookies) {
         const cookieEl = await createCookieElement(cookie);
         cookiesList.appendChild(cookieEl);
       }
@@ -112,127 +123,201 @@ async function loadCurrentTabCookies() {
   }
 }
 
-async function analyzeCookieData(cookie) {
-  // Check if cookie is already marked as blocked
-  const permissionKey = `cookie_${cookie.name}_${cookie.domain}`;
-  const stored = await chrome.storage.sync.get([permissionKey]);
-  const permission = stored[permissionKey] || null;
-  
-  const isBlocked = cookie.blocked || (permission && permission.blocked);
-  
-  let potentialData = cookie.potentialData || detectPotentialData(cookie);
-  let riskScore = potentialData.length;
-  
-  // Check if it's third-party
-  if (currentTabUrl && cookie.value !== '[BLOCKED]') {
-    const currentDomain = new URL(currentTabUrl).hostname;
-    const cookieDomain = cookie.domain.replace(/^\./, '');
-    if (!currentDomain.includes(cookieDomain) && !cookieDomain.includes(currentDomain)) {
-      riskScore += 2;
-    }
-  }
-  
-  // Long expiration
-  if (cookie.expirationDate && cookie.expirationDate > Date.now() / 1000 + 31536000) {
-    riskScore += 1;
-  }
-  
-  // Not secure
-  if (!cookie.secure && currentTabUrl && currentTabUrl.startsWith('https')) {
-    riskScore += 1;
-  }
-  
-  // Blocked cookies are high risk
-  if (isBlocked) {
-    riskScore = Math.max(riskScore, 5);
-  }
-  
-  let riskLevel = 'low';
-  if (riskScore >= 5) riskLevel = 'high';
-  else if (riskScore >= 3) riskLevel = 'medium';
-  
-  return {
-    ...cookie,
-    potentialData: potentialData,
-    riskLevel: riskLevel,
-    riskScore: riskScore,
-    permission: permission,
-    isBlocked: isBlocked
-  };
-}
-
-function detectPotentialData(cookie) {
-  const dataTypes = [];
-  const cookieStr = (cookie.name + '=' + cookie.value).toLowerCase();
-  
-  const dataPatterns = {
-    'email': ['email', '@', 'mail'],
-    'name': ['name', 'user', 'username', 'fullname'],
-    'location': ['location', 'geo', 'lat', 'long', 'gps', 'address'],
-    'device_info': ['device', 'os', 'browser', 'platform', 'useragent'],
-    'ip_address': ['ip', 'address'],
-    'browsing_behavior': ['behavior', 'click', 'scroll', 'movement', 'activity'],
-    'preferences': ['preference', 'setting', 'config', 'theme'],
-    'session_data': ['session', 'login', 'token', 'auth'],
-    'marketing_data': ['ad', 'marketing', 'campaign', 'tracking', 'analytics'],
-    'social_media_data': ['social', 'facebook', 'twitter', 'linkedin', 'instagram', 'google']
-  };
-  
-  for (const [dataType, patterns] of Object.entries(dataPatterns)) {
-    if (patterns.some(pattern => cookieStr.includes(pattern))) {
-      dataTypes.push(dataType);
-    }
-  }
-  
-  return [...new Set(dataTypes)];
-}
-
 async function createCookieElement(cookie) {
   const div = document.createElement('div');
   div.className = 'cookie-item';
-  const checkboxId = cookie.name.replace(/[^a-zA-Z0-9]/g, '-') + '-' + Date.now();
+  const checkboxId = cookie.name.replace(/[^a-zA-Z0-9]/g, '-') + '-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
   
-  // Add visual styling for blocked cookies
-  if (cookie.isBlocked) {
-    div.style.opacity = '0.7';
+  const isBlockedByPermission = cookie.permission && cookie.permission.blocked;
+  const isCookieActive = cookie.status === 'active' && cookie.value !== '[BLOCKED/REMOVED]';
+  
+  const isBlocked = isBlockedByPermission && !isCookieActive;
+  const isUnblockedButNotSet = !isBlockedByPermission && !isCookieActive && cookie.status !== 'removed';
+  const isRemoved = cookie.status === 'removed' && !isBlockedByPermission;
+  
+  const isEphemeral = isEphemeralCookie(cookie);
+  const isSuspicious = cookie.riskScore >= 3;
+  
+  if (isBlocked) {
+    div.style.opacity = '0.85';
     div.style.border = '2px solid #dc3545';
     div.style.background = '#fff5f5';
+  } else if (isUnblockedButNotSet) {
+    div.style.opacity = '0.75';
+    div.style.border = '2px solid #ffc107';
+    div.style.background = '#fffbf0';
+  } else if (isRemoved) {
+    div.style.opacity = '0.7';
+    div.style.border = '1px dashed #6c757d';
+    div.style.background = '#f8f9fa';
+  } else if (isSuspicious && isCookieActive) {
+    div.style.border = '2px solid #ff6b6b';
+    div.style.background = '#fff8f8';
   }
   
-  const dataTypesHTML = cookie.potentialData.length > 0 
+  const dataTypesHTML = cookie.potentialData && cookie.potentialData.length > 0 
     ? cookie.potentialData.map(dt => dt.replace(/_/g, ' ')).join(', ')
     : '<em style="color: #999;">No specific data types detected</em>';
 
-  // Show current permission status
   let statusHTML = '';
-  if (cookie.isBlocked) {
-    statusHTML = '<div style="background: #f8d7da; color: #721c24; padding: 6px 10px; border-radius: 4px; font-size: 11px; margin-top: 8px; font-weight: bold;">🚫 BLOCKED - Cookie Removed from Browser</div>';
+  if (isBlocked) {
+    const blockedReason = cookie.autoBlocked ? ' (Auto-blocked)' : '';
+    const blockedTime = cookie.blockedAt ? ` at ${new Date(cookie.blockedAt).toLocaleString()}` : '';
+    statusHTML = `<div style="background: #f8d7da; color: #721c24; padding: 8px 12px; border-radius: 4px; font-size: 11px; margin-top: 8px; font-weight: bold;">
+      🚫 BLOCKED${blockedReason} - Cookie Removed from Browser
+      ${blockedTime ? `<div style="font-size: 9px; margin-top: 4px; font-weight: normal;">${blockedTime}</div>` : ''}
+    </div>`;
+  } else if (isUnblockedButNotSet) {
+    statusHTML = `<div style="background: #fff3cd; color: #856404; padding: 8px 12px; border-radius: 4px; font-size: 11px; margin-top: 8px; font-weight: bold;">
+      ⏳ UNBLOCKED - Waiting for Website to Set Cookie
+      <div style="font-size: 9px; margin-top: 4px; font-weight: normal;">Refresh the page to allow the website to restore this cookie</div>
+    </div>`;
+  } else if (isRemoved) {
+    if (isEphemeral) {
+      statusHTML = '<div style="background: #d1ecf1; color: #0c5460; padding: 6px 10px; border-radius: 4px; font-size: 11px; margin-top: 8px;">ℹ️ Temporary Cookie Expired (Normal Behavior)</div>';
+    } else {
+      statusHTML = '<div style="background: #e2e3e5; color: #383d41; padding: 6px 10px; border-radius: 4px; font-size: 11px; margin-top: 8px;">ℹ️ Cookie No Longer Active</div>';
+    }
   } else if (cookie.permission) {
     const action = cookie.permission.action;
     if (action === 'allow') {
-      statusHTML = '<div style="background: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px; font-size: 10px; margin-top: 8px;">✅ Currently Allowed</div>';
+      statusHTML = '<div style="background: #d4edda; color: #155724; padding: 6px 10px; border-radius: 4px; font-size: 11px; margin-top: 8px;">✅ Currently Allowed</div>';
     } else if (action === 'custom') {
-      statusHTML = `<div style="background: #d1ecf1; color: #0c5460; padding: 4px 8px; border-radius: 4px; font-size: 10px; margin-top: 8px;">⚙️ Custom (${cookie.permission.allowedDataTypes.length} types allowed)</div>`;
+      statusHTML = `<div style="background: #d1ecf1; color: #0c5460; padding: 6px 10px; border-radius: 4px; font-size: 11px; margin-top: 8px;">⚙️ Custom (${cookie.permission.allowedDataTypes.length} types allowed)</div>`;
     }
+  }
+
+  let timeInfoHTML = '';
+  if (cookie.firstSeen) {
+    const firstSeen = new Date(cookie.firstSeen).toLocaleString();
+    const lastSeen = cookie.lastSeen ? new Date(cookie.lastSeen).toLocaleString() : firstSeen;
+    timeInfoHTML = `
+      <div style="font-size: 10px; color: #999; margin-top: 6px; padding-top: 6px; border-top: 1px solid #e0e0e0;">
+        <div>First seen: ${firstSeen}</div>
+        ${lastSeen !== firstSeen ? `<div>Last seen: ${lastSeen}</div>` : ''}
+      </div>
+    `;
+  }
+
+  let statusText = '';
+  let statusIcon = '';
+  if (isBlocked) {
+    statusText = '<span style="color: #dc3545; font-weight: bold;">BLOCKED</span>';
+    statusIcon = '🚫';
+  } else if (isUnblockedButNotSet) {
+    statusText = '<span style="color: #ffc107; font-weight: bold;">UNBLOCKED (Not Set)</span>';
+    statusIcon = '⏳';
+  } else if (isRemoved) {
+    statusText = '<span style="color: #6c757d;">Removed</span>';
+    statusIcon = '⚠️';
+  } else {
+    statusText = '<span style="color: #28a745;">Active</span>';
+    statusIcon = '';
+  }
+
+  let suspiciousBadge = '';
+  if (isSuspicious && isCookieActive) {
+    suspiciousBadge = `
+      <span style="background: #ff6b6b; color: white; padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-left: 8px; font-weight: bold; animation: pulse 2s infinite;" title="This cookie collects ${cookie.potentialData?.length || 0} types of personal data">
+        ⚠️ SUSPICIOUS
+      </span>
+    `;
+  } else if (isSuspicious && isRemoved) {
+    suspiciousBadge = `
+      <span style="background: #ff6b6b; color: white; padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-left: 8px; opacity: 0.6;" title="This was a suspicious cookie">
+        ⚠️ WAS SUSPICIOUS
+      </span>
+    `;
+  }
+
+  let ephemeralBadge = '';
+  if (isEphemeral && isCookieActive) {
+    ephemeralBadge = `
+      <span style="background: #17a2b8; color: white; padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-left: 8px; font-weight: bold;" title="This cookie expires quickly (session or short-lived)">
+        ⏱️ TEMPORARY
+      </span>
+    `;
+  } else if (isEphemeral && isRemoved) {
+    ephemeralBadge = `
+      <span style="background: #6c757d; color: white; padding: 2px 8px; border-radius: 12px; font-size: 10px; margin-left: 8px; opacity: 0.6;" title="This was a temporary cookie">
+        ⏱️ WAS TEMPORARY
+      </span>
+    `;
+  }
+
+  // AI Explanation Section (NEW!)
+  let aiExplanationHTML = '';
+  if (cookie.aiExplanation) {
+    aiExplanationHTML = `
+      <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 10px 12px; border-radius: 6px; font-size: 11px; margin-top: 10px; line-height: 1.5; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+        <div style="display: flex; align-items: center; margin-bottom: 6px;">
+          <span style="font-size: 16px; margin-right: 6px;">🤖</span>
+          <strong style="font-size: 12px;">AI Explains:</strong>
+        </div>
+        <div style="font-size: 11px; opacity: 0.95;">
+          ${cookie.aiExplanation}
+        </div>
+      </div>
+    `;
+  } else {
+    // Show loading state
+    aiExplanationHTML = `
+      <div id="ai-loading-${checkboxId}" style="background: #f0f0f0; color: #666; padding: 8px 12px; border-radius: 6px; font-size: 11px; margin-top: 10px; text-align: center;">
+        <span style="animation: spin 1s linear infinite; display: inline-block;">🤖</span>
+        <span style="margin-left: 6px;">AI is analyzing this cookie...</span>
+      </div>
+    `;
+  }
+
+  let customButtonExplanation = '';
+  if (isCookieActive && cookie.potentialData && cookie.potentialData.length > 0) {
+    customButtonExplanation = `
+      <div style="background: #e7f3ff; padding: 8px 10px; border-radius: 4px; font-size: 10px; color: #004085; margin-top: 8px; border-left: 3px solid #007bff;">
+        💡 <strong>Tip:</strong> Use checkboxes below to select which data types to allow, then click <strong>⚙️ Custom</strong>
+      </div>
+    `;
+  }
+
+  if (!document.getElementById('suspicious-pulse-animation')) {
+    const style = document.createElement('style');
+    style.id = 'suspicious-pulse-animation';
+    style.textContent = `
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.7; }
+      }
+      @keyframes spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+      }
+    `;
+    document.head.appendChild(style);
   }
 
   div.innerHTML = `
     <div class="cookie-header">
       <span class="cookie-name" title="${cookie.name}">
-        ${cookie.isBlocked ? '🚫 ' : ''}${truncateText(cookie.name, 25)}
+        ${statusIcon} ${truncateText(cookie.name, 25)}
       </span>
-      <span class="risk-${cookie.riskLevel}">
-        ${cookie.riskLevel.toUpperCase()}
-      </span>
+      <div style="display: flex; align-items: center; flex-wrap: wrap; gap: 4px;">
+        <span class="risk-${cookie.riskLevel}">
+          ${cookie.riskLevel.toUpperCase()}
+        </span>
+        ${suspiciousBadge}
+        ${ephemeralBadge}
+      </div>
     </div>
     <div class="data-types">
       <div><strong>Domain:</strong> ${cookie.domain}</div>
       <div><strong>Expires:</strong> ${getExpirationText(cookie)}</div>
-      <div><strong>Status:</strong> ${cookie.isBlocked ? '<span style="color: #dc3545; font-weight: bold;">BLOCKED</span>' : '<span style="color: #28a745;">Active</span>'}</div>
+      <div><strong>Status:</strong> ${statusText}</div>
       <div><strong>May collect:</strong> ${dataTypesHTML}</div>
       ${statusHTML}
+      ${aiExplanationHTML}
+      ${customButtonExplanation}
+      ${timeInfoHTML}
     </div>
-    ${!cookie.isBlocked && cookie.potentialData.length > 0 ? `
+    ${isCookieActive && cookie.potentialData && cookie.potentialData.length > 0 ? `
       <div class="checkbox-group" id="checkboxes-${checkboxId}">
         ${cookie.potentialData.map(dataType => `
           <div class="checkbox-item">
@@ -243,23 +328,52 @@ async function createCookieElement(cookie) {
       </div>
     ` : ''}
     <div class="actions">
-      ${!cookie.isBlocked ? `
-        <button class="allow-btn" data-cookie-id="${checkboxId}">✅ Allow All</button>
-        <button class="block-btn" data-cookie-id="${checkboxId}">❌ Block</button>
-        ${cookie.potentialData.length > 0 ? 
-          `<button class="customize-btn" data-cookie-id="${checkboxId}">⚙️ Custom</button>` : 
+      ${isCookieActive ? `
+        <button class="allow-btn" data-cookie-id="${checkboxId}" title="Allow all data types for this cookie">✅ Allow All</button>
+        <button class="block-btn" data-cookie-id="${checkboxId}" title="Block this cookie and remove it from browser">❌ Block</button>
+        ${cookie.potentialData && cookie.potentialData.length > 0 ? 
+          `<button class="customize-btn" data-cookie-id="${checkboxId}" title="Apply custom data type selections from checkboxes above">⚙️ Custom</button>` : 
           ''
         }
-      ` : `
+      ` : isBlocked ? `
         <button class="allow-btn" data-cookie-id="${checkboxId}" style="flex: 1;">🔓 Unblock Cookie</button>
+      ` : isUnblockedButNotSet ? `
+        <button class="customize-btn" data-cookie-id="${checkboxId}" style="flex: 1;">🔄 Refresh Page to Restore</button>
+      ` : `
+        <div style="text-align: center; color: #6c757d; font-size: 11px; padding: 8px;">
+          ${isEphemeral ? 'This temporary cookie expired naturally.' : 'This cookie has been removed. It will reappear if the website sets it again.'}
+        </div>
       `}
     </div>
   `;
   
-  // Store cookie data on the element
+  // If AI explanation is not yet loaded, fetch it
+  if (!cookie.aiExplanation) {
+    chrome.runtime.sendMessage({
+      type: 'GET_AI_EXPLANATION',
+      cookie: cookie
+    }, (response) => {
+      if (response && response.explanation) {
+        const loadingEl = document.getElementById(`ai-loading-${checkboxId}`);
+        if (loadingEl) {
+          loadingEl.outerHTML = `
+            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 10px 12px; border-radius: 6px; font-size: 11px; margin-top: 10px; line-height: 1.5; box-shadow: 0 2px 4px rgba(0,0,0,0.1); animation: fadeIn 0.5s;">
+              <div style="display: flex; align-items: center; margin-bottom: 6px;">
+                <span style="font-size: 16px; margin-right: 6px;">🤖</span>
+                <strong style="font-size: 12px;">AI Explains:</strong>
+              </div>
+              <div style="font-size: 11px; opacity: 0.95;">
+                ${response.explanation}
+              </div>
+            </div>
+          `;
+        }
+      }
+    });
+  }
+  
   div.dataset.cookieData = JSON.stringify(cookie);
   
-  // Add event listeners
   const allowBtn = div.querySelector('.allow-btn');
   const blockBtn = div.querySelector('.block-btn');
   const customizeBtn = div.querySelector('.customize-btn');
@@ -267,8 +381,7 @@ async function createCookieElement(cookie) {
   if (allowBtn) {
     allowBtn.addEventListener('click', async (e) => {
       const cookieData = JSON.parse(div.dataset.cookieData);
-      if (cookieData.isBlocked) {
-        // Unblock the cookie
+      if (isBlocked) {
         await handleUnblock(cookieData);
       } else {
         await handleCookieAction(cookieData, 'allow', checkboxId);
@@ -286,7 +399,15 @@ async function createCookieElement(cookie) {
   if (customizeBtn) {
     customizeBtn.addEventListener('click', async (e) => {
       const cookieData = JSON.parse(div.dataset.cookieData);
-      await handleCookieAction(cookieData, 'custom', checkboxId);
+      if (isUnblockedButNotSet) {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (tab && tab.id) {
+          chrome.tabs.reload(tab.id);
+          showToast('🔄 Refreshing page to restore cookie...', 'info');
+        }
+      } else {
+        await handleCookieAction(cookieData, 'custom', checkboxId);
+      }
     });
   }
   
@@ -296,33 +417,97 @@ async function createCookieElement(cookie) {
 async function handleUnblock(cookie) {
   const permissionKey = `cookie_${cookie.name}_${cookie.domain}`;
   
-  // Remove the block permission
-  await chrome.storage.sync.remove([permissionKey]);
+  const modal = document.createElement('div');
+  modal.id = 'unblock-modal';
+  modal.style.cssText = `
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0,0,0,0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10002;
+  `;
   
-  showToast(`🔓 Unblocked ${cookie.name}. Refresh the page to restore this cookie.`, 'success');
+  modal.innerHTML = `
+    <div style="background: white; padding: 20px; border-radius: 12px; max-width: 350px; box-shadow: 0 8px 32px rgba(0,0,0,0.3);">
+      <div style="font-size: 16px; font-weight: bold; margin-bottom: 12px; color: #333;">
+        🔓 Unblock Cookie
+      </div>
+      <div style="font-size: 13px; color: #666; margin-bottom: 16px; line-height: 1.5;">
+        <strong style="color: #007bff;">${cookie.name}</strong> will be unblocked.
+        <br><br>
+        <strong>What would you like to do?</strong>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 10px;">
+        <button id="unblock-refresh-btn" style="background: #28a745; color: white; border: none; padding: 12px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500;">
+          🔄 Unblock & Refresh Page
+          <div style="font-size: 10px; opacity: 0.9; margin-top: 4px;">Recommended - Cookie will be restored immediately</div>
+        </button>
+        <button id="unblock-only-btn" style="background: #007bff; color: white; border: none; padding: 12px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500;">
+          ✓ Unblock Only
+          <div style="font-size: 10px; opacity: 0.9; margin-top: 4px;">Cookie will be allowed on next visit</div>
+        </button>
+        <button id="cancel-unblock-btn" style="background: #6c757d; color: white; border: none; padding: 10px; border-radius: 6px; cursor: pointer; font-size: 12px;">
+          Cancel
+        </button>
+      </div>
+    </div>
+  `;
   
-  // Immediately update stats and refresh list
-  setTimeout(async () => {
+  document.body.appendChild(modal);
+  
+  document.getElementById('unblock-refresh-btn').addEventListener('click', async () => {
+    modal.remove();
+    await chrome.storage.sync.remove([permissionKey]);
+    showToast(`🔓 Unblocked ${cookie.name}. Refreshing page...`, 'success');
     await updateStats();
-    await loadCurrentTabCookies();
-  }, 300);
+    setTimeout(async () => {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab && tab.id) {
+        chrome.tabs.reload(tab.id);
+      }
+    }, 500);
+  });
+  
+  document.getElementById('unblock-only-btn').addEventListener('click', async () => {
+    modal.remove();
+    await chrome.storage.sync.remove([permissionKey]);
+    showToast(`🔓 Unblocked ${cookie.name}. Cookie will be allowed on next page load.`, 'success');
+    setTimeout(async () => {
+      await updateStats();
+      await loadCurrentTabCookies();
+    }, 300);
+  });
+  
+  document.getElementById('cancel-unblock-btn').addEventListener('click', () => {
+    modal.remove();
+  });
+  
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) {
+      modal.remove();
+    }
+  });
 }
 
 async function handleCookieAction(cookie, action, checkboxId) {
   let dataTypesToAllow = [];
   
   if (action === 'allow') {
-    dataTypesToAllow = cookie.potentialData;
+    dataTypesToAllow = cookie.potentialData || [];
     showToast(`✅ Allowed all data for ${cookie.name}`, 'success');
   } else if (action === 'block') {
     dataTypesToAllow = [];
     showToast(`❌ Blocked ${cookie.name}. Cookie removed from browser.`, 'error');
     
-    // Actually remove the cookie
     try {
       const protocol = cookie.secure ? 'https:' : 'http:';
       const domain = cookie.domain.startsWith('.') ? cookie.domain.substring(1) : cookie.domain;
-      const url = `${protocol}//${domain}${cookie.path}`;
+      const url = `${protocol}//${domain}${cookie.path || '/'}`;
       
       await chrome.cookies.remove({
         url: url,
@@ -341,11 +526,10 @@ async function handleCookieAction(cookie, action, checkboxId) {
     });
     
     if (dataTypesToAllow.length === 0) {
-      // Remove cookie if no data types allowed
       try {
         const protocol = cookie.secure ? 'https:' : 'http:';
         const domain = cookie.domain.startsWith('.') ? cookie.domain.substring(1) : cookie.domain;
-        const url = `${protocol}//${domain}${cookie.path}`;
+        const url = `${protocol}//${domain}${cookie.path || '/'}`;
         
         await chrome.cookies.remove({
           url: url,
@@ -357,11 +541,10 @@ async function handleCookieAction(cookie, action, checkboxId) {
         console.error('Error removing cookie:', error);
       }
     } else {
-      showToast(`⚙️ Custom settings applied for ${cookie.name}`, 'info');
+      showToast(`⚙️ Custom settings applied for ${cookie.name} (${dataTypesToAllow.length} data types allowed)`, 'info');
     }
   }
   
-  // Store the user's preferences
   await chrome.runtime.sendMessage({
     type: 'UPDATE_COOKIE_PERMISSIONS',
     cookie: cookie,
@@ -369,7 +552,6 @@ async function handleCookieAction(cookie, action, checkboxId) {
     action: action
   });
   
-  // Immediately update stats and refresh list
   setTimeout(async () => {
     await updateStats();
     await loadCurrentTabCookies();
@@ -377,7 +559,6 @@ async function handleCookieAction(cookie, action, checkboxId) {
 }
 
 function setupEventListeners() {
-  // Tab navigation
   document.querySelectorAll('.nav-item').forEach(item => {
     item.addEventListener('click', () => {
       document.querySelectorAll('.nav-item').forEach(nav => nav.classList.remove('active'));
@@ -388,10 +569,7 @@ function setupEventListeners() {
     });
   });
   
-  // Save settings
   document.getElementById('save-settings').addEventListener('click', saveSettings);
-  
-  // Tools
   document.getElementById('clear-data').addEventListener('click', clearData);
   document.getElementById('export-data').addEventListener('click', exportData);
 }
@@ -445,10 +623,12 @@ function saveSettings() {
 function clearData() {
   if (confirm('Are you sure you want to clear all cookie permissions and settings? This will not delete the actual cookies, only your preferences.')) {
     chrome.storage.sync.clear(async () => {
-      showToast('✅ All preferences cleared successfully!', 'success');
-      loadSettings();
-      await updateStats();
-      await loadCurrentTabCookies();
+      chrome.storage.local.remove(['cookieHistory', 'cookieExplanations'], async () => {
+        showToast('✅ All preferences and history cleared successfully!', 'success');
+        loadSettings();
+        await updateStats();
+        await loadCurrentTabCookies();
+      });
     });
   }
 }
@@ -457,7 +637,6 @@ async function exportData() {
   try {
     showToast('📤 Preparing export...', 'info');
     
-    // Get all cookie data from background script
     const response = await chrome.runtime.sendMessage({ type: 'GET_ALL_COOKIE_DATA' });
     
     if (response.error) {
@@ -470,7 +649,6 @@ async function exportData() {
       return;
     }
     
-    // Create formatted export data
     const exportData = {
       exportInfo: {
         extensionName: 'Cookie Privacy Guard',
@@ -507,64 +685,41 @@ async function updateStats() {
   try {
     if (!currentTabUrl) return;
     
-    const cookies = await chrome.cookies.getAll({ url: currentTabUrl });
-    const allPermissions = await chrome.storage.sync.get(null);
+    const response = await chrome.runtime.sendMessage({ type: 'GET_ALL_COOKIE_DATA' });
     
-    let suspiciousCount = 0;
-    let blockedCount = 0;
-    let allowedCount = 0;
-    
-    // Track all cookies
-    const allCookieKeys = new Set();
-    
-    // Count current cookies
-    for (const cookie of cookies) {
-      const cookieKey = `${cookie.name}_${cookie.domain}`;
-      allCookieKeys.add(cookieKey);
+    if (response.cookies) {
+      let suspiciousCount = 0;
+      let blockedCount = 0;
+      let allowedCount = 0;
       
-      const analyzed = await analyzeCookieData(cookie);
-      if (analyzed.riskScore >= 3) {
-        suspiciousCount++;
-      }
-      
-      const permissionKey = `cookie_${cookie.name}_${cookie.domain}`;
-      if (allPermissions[permissionKey]) {
-        const permission = allPermissions[permissionKey];
-        if (permission.action === 'allow') {
-          allowedCount++;
-        } else if (permission.action === 'custom' && permission.allowedDataTypes.length > 0) {
-          allowedCount++;
+      for (const cookie of response.cookies) {
+        if (cookie.riskScore >= 3) {
+          suspiciousCount++;
         }
-      }
-    }
-    
-    // Count blocked cookies
-    for (const [key, value] of Object.entries(allPermissions)) {
-      if (key.startsWith('cookie_') && value.blocked) {
-        const cookieKey = `${value.cookieName}_${value.cookieDomain}`;
         
-        // Add to total if not already counted
-        if (!allCookieKeys.has(cookieKey)) {
-          allCookieKeys.add(cookieKey);
-          
-          // Blocked cookies might have been suspicious
-          if (value.potentialData && value.potentialData.length >= 3) {
-            suspiciousCount++;
+        const isBlocked = cookie.permission && cookie.permission.blocked && cookie.value === '[BLOCKED/REMOVED]';
+        if (isBlocked) {
+          blockedCount++;
+        }
+        
+        if (cookie.permission) {
+          if (cookie.permission.action === 'allow') {
+            allowedCount++;
+          } else if (cookie.permission.action === 'custom' && cookie.permission.allowedDataTypes.length > 0) {
+            allowedCount++;
           }
         }
-        
-        blockedCount++;
       }
+      
+      const stats = {
+        total: response.cookies.length,
+        suspicious: suspiciousCount,
+        blocked: blockedCount,
+        allowed: allowedCount
+      };
+      
+      displayStats(stats);
     }
-    
-    const stats = {
-      total: allCookieKeys.size,
-      suspicious: suspiciousCount,
-      blocked: blockedCount,
-      allowed: allowedCount
-    };
-    
-    displayStats(stats);
   } catch (error) {
     console.error('Error updating stats:', error);
   }
@@ -581,7 +736,13 @@ function truncateText(text, maxLength) {
 }
 
 function getExpirationText(cookie) {
-  if (cookie.isBlocked) return 'N/A (Blocked)';
+  const isBlocked = cookie.permission && cookie.permission.blocked && cookie.value === '[BLOCKED/REMOVED]';
+  const isUnblockedButNotSet = !isBlocked && cookie.value === '[BLOCKED/REMOVED]';
+  const isRemoved = cookie.status === 'removed';
+  
+  if (isBlocked) return 'N/A (Blocked)';
+  if (isUnblockedButNotSet) return 'N/A (Not Set)';
+  if (isRemoved) return 'N/A (Removed)';
   if (!cookie.expirationDate) return 'Session';
   
   const now = Date.now() / 1000;
@@ -623,6 +784,10 @@ function showToast(message, type = 'info') {
     @keyframes slideUp {
       from { transform: translateX(-50%) translateY(100%); opacity: 0; }
       to { transform: translateX(-50%) translateY(0); opacity: 1; }
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(-10px); }
+      to { opacity: 1; transform: translateY(0); }
     }
   `;
   if (!document.querySelector('style[data-toast]')) {
