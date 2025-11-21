@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      width: 450px;
+      min-height: 500px;
+      margin: 0;
+      padding: 0;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: #f5f5f5;
+    }
+    .header {
+      background: linear-gradient(135deg, #2196F3, #1976D2);
+      color: white;
+      padding: 20px;
+      margin-bottom: 16px;
+      text-align: center;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .container {
+      padding: 0 16px 16px 16px;
+    }
+    .cookie-item {
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 12px;
+      background: white;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .cookie-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .cookie-name {
+      font-weight: bold;
+      color: #333;
+      font-size: 14px;
+    }
+    .risk-high { 
+      color: #dc3545;
+      background: #f8d7da;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 10px;
+      font-weight: bold;
+    }
+    .risk-medium { 
+      color: #fd7e14;
+      background: #fff3cd;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 10px;
+      font-weight: bold;
+    }
+    .risk-low { 
+      color: #198754;
+      background: #d1edff;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 10px;
+      font-weight: bold;
+    }
+    .data-types {
+      font-size: 12px;
+      color: #666;
+      margin: 8px 0;
+      line-height: 1.4;
+    }
+    .checkbox-group {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin: 12px 0;
+      padding: 12px;
+      background: #f8f9fa;
+      border-radius: 6px;
+    }
+    .checkbox-item {
+      display: flex;
+      align-items: center;
+      font-size: 11px;
+    }
+    .checkbox-item input {
+      margin-right: 6px;
+      transform: scale(0.9);
+    }
+    .checkbox-item label {
+      color: #555;
+      cursor: pointer;
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    button {
+      padding: 8px 12px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 500;
+      transition: all 0.2s;
+      flex: 1;
+    }
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    }
+    .allow-btn { 
+      background: #28a745; 
+      color: white; 
+    }
+    .allow-btn:hover { background: #218838; }
+    .block-btn { 
+      background: #dc3545; 
+      color: white; 
+    }
+    .block-btn:hover { background: #c82333; }
+    .customize-btn { 
+      background: #007bff; 
+      color: white; 
+    }
+    .customize-btn:hover { background: #0056b3; }
+    .empty-state {
+      text-align: center;
+      padding: 40px 20px;
+      color: #666;
+      background: white;
+      border-radius: 8px;
+      margin: 20px 0;
+    }
+    .empty-state img {
+      font-size: 48px;
+      margin-bottom: 16px;
+    }
+    .tab {
+      display: none;
+    }
+    .tab.active {
+      display: block;
+    }
+    .nav {
+      display: flex;
+      margin-bottom: 0;
+      background: white;
+      border-bottom: 1px solid #e0e0e0;
+    }
+    .nav-item {
+      padding: 12px 20px;
+      cursor: pointer;
+      border-bottom: 3px solid transparent;
+      font-size: 13px;
+      font-weight: 500;
+      color: #666;
+      transition: all 0.2s;
+      flex: 1;
+      text-align: center;
+    }
+    .nav-item.active {
+      border-bottom-color: #2196F3;
+      color: #2196F3;
+      background: #f8f9fa;
+    }
+    .nav-item:hover {
+      background: #f8f9fa;
+      color: #2196F3;
+    }
+    .stats {
+      display: flex;
+      justify-content: space-around;
+      background: white;
+      padding: 12px;
+      margin: 12px 0;
+      border-radius: 8px;
+      font-size: 12px;
+    }
+    .stat-item {
+      text-align: center;
+    }
+    .stat-value {
+      font-size: 18px;
+      font-weight: bold;
+      color: #2196F3;
+    }
+    .stat-label {
+      color: #666;
+      margin-top: 4px;
+    }
+    .current-site {
+      background: white;
+      padding: 12px 16px;
+      margin: 12px 0;
+      border-radius: 8px;
+      font-size: 12px;
+      color: #666;
+      border-left: 4px solid #2196F3;
+    }
+    .setting-item {
+      background: white;
+      padding: 12px;
+      margin: 8px 0;
+      border-radius: 6px;
+    }
+    .section-title {
+      font-size: 14px;
+      font-weight: bold;
+      color: #333;
+      margin: 16px 0 8px 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h2 style="margin: 0; font-size: 18px;">🍪 Cookie Privacy Guard</h2>
+    <div style="font-size: 12px; opacity: 0.9; margin-top: 4px;">Take control of your data</div>
+  </div>
+
+  <div class="nav">
+    <div class="nav-item active" data-tab="current">🛡️ Protection</div>
+    <div class="nav-item" data-tab="settings">⚙️ Settings</div>
+  </div>
+
+  <div class="container">
+    <div id="current-tab" class="tab active">
+      <div id="current-site" class="current-site">
+        <div style="font-weight: bold; color: #2196F3;">🌐 Current Website</div>
+        <div id="site-url">Loading...</div>
+      </div>
+      
+      <div class="stats">
+        <div class="stat-item">
+          <div class="stat-value" id="total-cookies">0</div>
+          <div class="stat-label">Total Cookies</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="suspicious-cookies">0</div>
+          <div class="stat-label">Suspicious</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-value" id="blocked-cookies">0</div>
+          <div class="stat-label">Blocked</div>
+        </div>
+      </div>
+
+      <div id="cookies-list"></div>
+    </div>
+
+    <div id="settings-tab" class="tab">
+      <div class="section-title">🛡️ Protection Settings</div>
+      <div class="setting-item">
+        <div class="checkbox-item">
+          <input type="checkbox" id="auto-block-high-risk">
+          <label for="auto-block-high-risk"><strong>Automatically block high-risk cookies</strong></label>
+        </div>
+        <div style="font-size: 11px; color: #666; margin-top: 4px;">
+          Automatically block cookies with high risk scores
+        </div>
+      </div>
+      
+      <div class="setting-item">
+        <div class="checkbox-item">
+          <input type="checkbox" id="show-notifications">
+          <label for="show-notifications"><strong>Show cookie detection notifications</strong></label>
+        </div>
+        <div style="font-size: 11px; color: #666; margin-top: 4px;">
+          Show popup notifications when suspicious cookies are detected
+        </div>
+      </div>
+      
+      <div class="section-title">📊 Default Data Permissions</div>
+      <div class="setting-item">
+        <div class="checkbox-group" style="grid-template-columns: 1fr; background: transparent; padding: 0;">
+          <div class="checkbox-item">
+            <input type="checkbox" id="allow-email" checked>
+            <label for="allow-email">Email Address</label>
+          </div>
+          <div class="checkbox-item">
+            <input type="checkbox" id="allow-location" checked>
+            <label for="allow-location">Location Data</label>
+          </div>
+          <div class="checkbox-item">
+            <input type="checkbox" id="allow-device" checked>
+            <label for="allow-device">Device Information</label>
+          </div>
+          <div class="checkbox-item">
+            <input type="checkbox" id="allow-behavior" checked>
+            <label for="allow-behavior">Browsing Behavior</label>
+          </div>
+          <div class="checkbox-item">
+            <input type="checkbox" id="allow-social" checked>
+            <label for="allow-social">Social Media Data</label>
+          </div>
+          <div class="checkbox-item">
+            <input type="checkbox" id="allow-marketing" checked>
+            <label for="allow-marketing">Marketing Data</label>
+          </div>
+        </div>
+      </div>
+      
+      <button id="save-settings" style="background: #28a745; color: white; width: 100%; margin-top: 16px; padding: 12px;">
+        💾 Save Settings
+      </button>
+      
+      <div class="section-title">🔧 Tools</div>
+      <div class="setting-item">
+        <button id="clear-data" style="background: #6c757d; margin-bottom: 8px;">
+          🗑️ Clear All Cookie Data
+        </button>
+        <button id="export-data" style="background: #17a2b8;">
+          📤 Export Settings
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

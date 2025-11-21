@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Cookie Privacy Guard",
+  "version": "1.0",
+  "description": "Monitor and control what personal data cookies can access",
+  "permissions": [
+    "cookies",
+    "storage",
+    "activeTab",
+    "tabs",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Cookie Privacy Guard"
+  }
+}
